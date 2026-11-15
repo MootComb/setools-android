@@ -76,11 +76,14 @@ jobs:
         run: |
           set -e
           echo "NDK ABI: ${{ matrix.ndk_abi }}"
-          # Build only the requested ABI. The project uses jni/Android.mk
-          # and jni/Application.mk at the top of the jni/ tree.
+          # NDK_PROJECT_PATH is the repository root, and
+          # APP_BUILD_SCRIPT / NDK_APPLICATION_MK are given
+          # relative to that root. This avoids the cwd change
+          # caused by "ndk-build -C jni".
           ndk-build \
-            -C jni \
             NDK_PROJECT_PATH=. \
+            APP_BUILD_SCRIPT=jni/Android.mk \
+            NDK_APPLICATION_MK=jni/Application.mk \
             APP_ABI=${{ matrix.ndk_abi }} \
             APP_PLATFORM=android-21 \
             V=1
@@ -91,8 +94,6 @@ jobs:
           set -e
           # ndk-build puts final binaries in libs/<abi>/ and
           # intermediate objects in obj/local/<abi>/.
-          # Standalone utilities (if any) end up in libs/<abi>/ too,
-          # because Android.mk uses BUILD_EXECUTABLE.
           UTILS=""
           for d in "libs/${{ matrix.ndk_abi }}" "obj/local/${{ matrix.ndk_abi }}"; do
             [ -d "$d" ] || continue
