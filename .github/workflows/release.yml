@@ -47,11 +47,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # NDK ABIs, not Linux ABIs:
-          #   arm64-v8a   -> aarch64
-          #   armeabi-v7a -> armv7l
-          #   x86_64      -> x86_64
-          #   x86         -> i686
           - ndk_abi: arm64-v8a
             abi: aarch64
           - ndk_abi: armeabi-v7a
@@ -76,10 +71,6 @@ jobs:
         run: |
           set -e
           echo "NDK ABI: ${{ matrix.ndk_abi }}"
-          # NDK_PROJECT_PATH is the repository root, and
-          # APP_BUILD_SCRIPT / NDK_APPLICATION_MK are given
-          # relative to that root. This avoids the cwd change
-          # caused by "ndk-build -C jni".
           ndk-build \
             NDK_PROJECT_PATH=. \
             APP_BUILD_SCRIPT=jni/Android.mk \
@@ -92,8 +83,6 @@ jobs:
         id: collect
         run: |
           set -e
-          # ndk-build puts final binaries in libs/<abi>/ and
-          # intermediate objects in obj/local/<abi>/.
           UTILS=""
           for d in "libs/${{ matrix.ndk_abi }}" "obj/local/${{ matrix.ndk_abi }}"; do
             [ -d "$d" ] || continue
@@ -115,7 +104,6 @@ jobs:
           UTILS="$(echo $UTILS | tr ' ' '\n' | sort -u | tr '\n' ' ')"
           if [ -z "$UTILS" ]; then
             echo "No ELF executables found after build" >&2
-            echo "Files in libs/${{ matrix.ndk_abi }} and obj/local/${{ matrix.ndk_abi }}:" >&2
             ls -la "libs/${{ matrix.ndk_abi }}" 2>/dev/null >&2 || true
             ls -la "obj/local/${{ matrix.ndk_abi }}" 2>/dev/null >&2 || true
             exit 1
@@ -134,14 +122,12 @@ jobs:
 
           mkdir -p "dist/$NAME" dist/bin
 
-          # Archive contains only the built utilities, no README/VERSION.
           for U in $UTILS; do
             base="$(basename "$U")"
             cp -a "$U" "dist/$NAME/$base"
           done
           tar -C dist -czf "dist/$NAME.tar.gz" "$NAME"
 
-          # Standalone binaries without archive, with ABI and version in the name.
           for U in $UTILS; do
             base="$(basename "$U")"
             OUT="dist/bin/${base}-${ABI}-${VERSION}"
@@ -198,7 +184,8 @@ jobs:
             - Fixed compilation on newer platforms
           files: |
             artifacts/*.tar.gz
-            artifacts/*-*-*
+            artifacts/*-*-[0-9]*
           fail_on_unmatched_files: true
+          overwrite_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
