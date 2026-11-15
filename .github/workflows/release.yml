@@ -47,50 +47,54 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - abi: x86_64
-            cc: gcc
-            apt: gcc make libsepol-dev
-            cflags: ""
-          - abi: aarch64
-            cc: aarch64-linux-gnu-gcc
-            apt: gcc-aarch64-linux-gnu make libsepol-dev
-            cflags: ""
-          - abi: armv7l
-            cc: arm-linux-gnueabihf-gcc
-            apt: gcc-arm-linux-gnueabihf make libsepol-dev
-            cflags: ""
-          - abi: i686
-            cc: gcc
-            apt: gcc make gcc-multilib libc6-dev-i386 libsepol-dev
-            cflags: "-m32"
+          # NDK ABIs, not Linux ABIs:
+          #   arm64-v8a   -> aarch64
+          #   armeabi-v7a -> armv7l
+          #   x86_64      -> x86_64
+          #   x86         -> i686
+          - ndk_abi: arm64-v8a
+            abi: aarch64
+          - ndk_abi: armeabi-v7a
+            abi: armv7l
+          - ndk_abi: x86_64
+            abi: x86_64
+          - ndk_abi: x86
+            abi: i686
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           submodules: false
 
-      - name: Install build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ${{ matrix.apt }}
+      - name: Setup NDK
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r26d
+          add-to-path: true
 
-      - name: Build
-        env:
-          CC: ${{ matrix.cc }}
-          EXTRA_CFLAGS: ${{ matrix.cflags }}
+      - name: Build with ndk-build
         run: |
           set -e
-          make clean || true
-          make CC="$CC" CFLAGS="-O2 -Wall $EXTRA_CFLAGS"
+          echo "NDK ABI: ${{ matrix.ndk_abi }}"
+          # Build only the requested ABI. The project uses jni/Android.mk
+          # and jni/Application.mk at the top of the jni/ tree.
+          ndk-build \
+            -C jni \
+            NDK_PROJECT_PATH=. \
+            APP_ABI=${{ matrix.ndk_abi }} \
+            APP_PLATFORM=android-21 \
+            V=1
 
       - name: Collect utilities
         id: collect
         run: |
           set -e
-          # Find ELF executables in the project root and in src/, bin/, build/
-          # and exclude object files, libraries, build scripts, and docs.
+          # ndk-build puts final binaries in libs/<abi>/ and
+          # intermediate objects in obj/local/<abi>/.
+          # Standalone utilities (if any) end up in libs/<abi>/ too,
+          # because Android.mk uses BUILD_EXECUTABLE.
           UTILS=""
-          for d in . src bin build; do
+          for d in "libs/${{ matrix.ndk_abi }}" "obj/local/${{ matrix.ndk_abi }}"; do
             [ -d "$d" ] || continue
             for f in "$d"/*; do
               [ -f "$f" ] || continue
@@ -100,14 +104,9 @@ jobs:
                   continue
                   ;;
               esac
-              # ELF magic check
               if head -c4 "$f" | od -An -tx1 | tr -d ' \n' | grep -q '^7f454c46$'; then
                 if [ -x "$f" ]; then
-                  if [ "$d" = "." ]; then
-                    UTILS="$UTILS $base"
-                  else
-                    UTILS="$UTILS $d/$base"
-                  fi
+                  UTILS="$UTILS $d/$base"
                 fi
               fi
             done
@@ -115,8 +114,9 @@ jobs:
           UTILS="$(echo $UTILS | tr ' ' '\n' | sort -u | tr '\n' ' ')"
           if [ -z "$UTILS" ]; then
             echo "No ELF executables found after build" >&2
-            echo "Files in tree:" >&2
-            find . -maxdepth 2 -type f -exec file {} \; >&2 || true
+            echo "Files in libs/${{ matrix.ndk_abi }} and obj/local/${{ matrix.ndk_abi }}:" >&2
+            ls -la "libs/${{ matrix.ndk_abi }}" 2>/dev/null >&2 || true
+            ls -la "obj/local/${{ matrix.ndk_abi }}" 2>/dev/null >&2 || true
             exit 1
           fi
           echo "Utilities: $UTILS"
@@ -133,7 +133,6 @@ jobs:
 
           mkdir -p "dist/$NAME" dist/bin
 
-          # 1) Full archive with all utilities
           for U in $UTILS; do
             base="$(basename "$U")"
             cp -a "$U" "dist/$NAME/$base"
@@ -143,7 +142,6 @@ jobs:
           tar -C dist -czf "dist/$NAME.tar.gz" "$NAME"
           sha256sum "dist/$NAME.tar.gz" > "dist/$NAME.tar.gz.sha256"
 
-          # 2) Standalone binaries without tar.gz, with ABI and version in the name
           for U in $UTILS; do
             base="$(basename "$U")"
             OUT="dist/bin/${base}-${ABI}-${VERSION}"
@@ -196,7 +194,7 @@ jobs:
             - `<utility>-<abi>-<version>`
             - `<utility>-<abi>-<version>.sha256`
 
-            Supported ABIs: `x86_64`, `aarch64`, `armv7l`, `i686`.
+            Supported ABIs: `aarch64`, `armv7l`, `x86_64`, `i686`.
 
             ## Changes
             - Support for injecting multiple rules at once
