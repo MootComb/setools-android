@@ -1,0 +1,141 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  TOOL_NAME: setools-android
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.read_version.outputs.version }}
+      tag: ${{ steps.read_version.outputs.tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read VERSION
+        id: read_version
+        run: |
+          if [ ! -f VERSION ]; then
+            echo "VERSION file not found" >&2
+            exit 1
+          fi
+          VERSION="$(grep -v '^[[:space:]]*$' VERSION | head -n1 | tr -d '[:space:]')"
+          if [ -z "$VERSION" ]; then
+            echo "VERSION file is empty" >&2
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Version: $VERSION"
+
+  build:
+    needs: prepare
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - abi: x86_64
+            cc: gcc
+            apt: gcc make libsepol-dev
+          - abi: aarch64
+            cc: aarch64-linux-gnu-gcc
+            apt: gcc-aarch64-linux-gnu make libsepol-dev:arm64
+          - abi: armv7l
+            cc: arm-linux-gnueabihf-gcc
+            apt: gcc-arm-linux-gnueabihf make libsepol-dev:armhf
+          - abi: i686
+            cc: gcc
+            apt: gcc make libsepol-dev
+            extra_cflags: -m32
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo dpkg --add-architecture arm64 || true
+          sudo dpkg --add-architecture armhf || true
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.apt }}
+          # для i686 нужны 32-битные библиотеки
+          if [ "${{ matrix.abi }}" = "i686" ]; then
+            sudo apt-get install -y gcc-multilib libc6-dev-i386 libsepol-dev:i386 || true
+          fi
+
+      - name: Build
+        env:
+          CC: ${{ matrix.cc }}
+          EXTRA_CFLAGS: ${{ matrix.extra_cflags }}
+        run: |
+          set -e
+          # подставьте свою команду сборки
+          make clean || true
+          make CC="$CC" CFLAGS="-O2 -Wall $EXTRA_CFLAGS"
+
+      - name: Package
+        run: |
+          set -e
+          VERSION="${{ needs.prepare.outputs.version }}"
+          ABI="${{ matrix.abi }}"
+          NAME="${TOOL_NAME}-${ABI}-${VERSION}"
+          mkdir -p "dist/$NAME"
+          # подставьте список артефактов, которые нужно положить в архив
+          cp -a sepolicy-inject "dist/$NAME/" 2>/dev/null || true
+          cp -a README* "dist/$NAME/" 2>/dev/null || true
+          cp -a VERSION "dist/$NAME/" 2>/dev/null || true
+          tar -C dist -czf "dist/$NAME.tar.gz" "$NAME"
+          sha256sum "dist/$NAME.tar.gz" > "dist/$NAME.tar.gz.sha256"
+          ls -l dist
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.TOOL_NAME }}-${{ matrix.abi }}-${{ needs.prepare.outputs.version }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+
+  release:
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -lR artifacts
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          name: ${{ env.TOOL_NAME }} ${{ needs.prepare.outputs.version }}
+          body: |
+            Release ${{ needs.prepare.outputs.version }} of ${{ env.TOOL_NAME }}.
+
+            Assets are named `<tool>-<abi>-<version>.tar.gz`, one per architecture.
+
+            ## Changes
+            - Support for injecting multiple rules at once
+            - Support for rules files
+            - Fixed compilation on newer platforms
+          files: |
+            artifacts/*.tar.gz
+            artifacts/*.sha256
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
