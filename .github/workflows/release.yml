@@ -14,13 +14,15 @@ env:
 
 jobs:
   prepare:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       version: ${{ steps.read_version.outputs.version }}
       tag: ${{ steps.read_version.outputs.tag }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          submodules: false
 
       - name: Read VERSION
         id: read_version
@@ -40,7 +42,7 @@ jobs:
 
   build:
     needs: prepare
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
@@ -48,55 +50,109 @@ jobs:
           - abi: x86_64
             cc: gcc
             apt: gcc make libsepol-dev
+            cflags: ""
           - abi: aarch64
             cc: aarch64-linux-gnu-gcc
-            apt: gcc-aarch64-linux-gnu make libsepol-dev:arm64
+            apt: gcc-aarch64-linux-gnu make libsepol-dev
+            cflags: ""
           - abi: armv7l
             cc: arm-linux-gnueabihf-gcc
-            apt: gcc-arm-linux-gnueabihf make libsepol-dev:armhf
+            apt: gcc-arm-linux-gnueabihf make libsepol-dev
+            cflags: ""
           - abi: i686
             cc: gcc
-            apt: gcc make libsepol-dev
-            extra_cflags: -m32
+            apt: gcc make gcc-multilib libc6-dev-i386 libsepol-dev
+            cflags: "-m32"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          submodules: false
 
       - name: Install build dependencies
         run: |
-          sudo dpkg --add-architecture arm64 || true
-          sudo dpkg --add-architecture armhf || true
           sudo apt-get update
           sudo apt-get install -y ${{ matrix.apt }}
-          # для i686 нужны 32-битные библиотеки
-          if [ "${{ matrix.abi }}" = "i686" ]; then
-            sudo apt-get install -y gcc-multilib libc6-dev-i386 libsepol-dev:i386 || true
-          fi
 
       - name: Build
         env:
           CC: ${{ matrix.cc }}
-          EXTRA_CFLAGS: ${{ matrix.extra_cflags }}
+          EXTRA_CFLAGS: ${{ matrix.cflags }}
         run: |
           set -e
-          # подставьте свою команду сборки
           make clean || true
           make CC="$CC" CFLAGS="-O2 -Wall $EXTRA_CFLAGS"
 
+      - name: Collect utilities
+        id: collect
+        run: |
+          set -e
+          # Find ELF executables in the project root and in src/, bin/, build/
+          # and exclude object files, libraries, build scripts, and docs.
+          UTILS=""
+          for d in . src bin build; do
+            [ -d "$d" ] || continue
+            for f in "$d"/*; do
+              [ -f "$f" ] || continue
+              base="$(basename "$f")"
+              case "$base" in
+                *.o|*.a|*.so|*.so.*|*.d|*.h|*.c|*.cc|*.cpp|*.hpp|*.sh|Makefile|makefile|GNUmakefile|VERSION|README*|LICENSE*|*.txt|*.md|*.tar.gz|*.sha256)
+                  continue
+                  ;;
+              esac
+              # ELF magic check
+              if head -c4 "$f" | od -An -tx1 | tr -d ' \n' | grep -q '^7f454c46$'; then
+                if [ -x "$f" ]; then
+                  if [ "$d" = "." ]; then
+                    UTILS="$UTILS $base"
+                  else
+                    UTILS="$UTILS $d/$base"
+                  fi
+                fi
+              fi
+            done
+          done
+          UTILS="$(echo $UTILS | tr ' ' '\n' | sort -u | tr '\n' ' ')"
+          if [ -z "$UTILS" ]; then
+            echo "No ELF executables found after build" >&2
+            echo "Files in tree:" >&2
+            find . -maxdepth 2 -type f -exec file {} \; >&2 || true
+            exit 1
+          fi
+          echo "Utilities: $UTILS"
+          echo "utils=$UTILS" >> "$GITHUB_OUTPUT"
+
       - name: Package
+        env:
+          UTILS: ${{ steps.collect.outputs.utils }}
         run: |
           set -e
           VERSION="${{ needs.prepare.outputs.version }}"
           ABI="${{ matrix.abi }}"
           NAME="${TOOL_NAME}-${ABI}-${VERSION}"
-          mkdir -p "dist/$NAME"
-          # подставьте список артефактов, которые нужно положить в архив
-          cp -a sepolicy-inject "dist/$NAME/" 2>/dev/null || true
+
+          mkdir -p "dist/$NAME" dist/bin
+
+          # 1) Full archive with all utilities
+          for U in $UTILS; do
+            base="$(basename "$U")"
+            cp -a "$U" "dist/$NAME/$base"
+          done
           cp -a README* "dist/$NAME/" 2>/dev/null || true
           cp -a VERSION "dist/$NAME/" 2>/dev/null || true
           tar -C dist -czf "dist/$NAME.tar.gz" "$NAME"
           sha256sum "dist/$NAME.tar.gz" > "dist/$NAME.tar.gz.sha256"
-          ls -l dist
+
+          # 2) Standalone binaries without tar.gz, with ABI and version in the name
+          for U in $UTILS; do
+            base="$(basename "$U")"
+            OUT="dist/bin/${base}-${ABI}-${VERSION}"
+            cp -a "$U" "$OUT"
+            chmod +x "$OUT"
+            sha256sum "$OUT" > "${OUT}.sha256"
+          done
+
+          ls -lR dist
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -105,10 +161,11 @@ jobs:
           path: |
             dist/*.tar.gz
             dist/*.sha256
+            dist/bin/*
 
   release:
     needs: [prepare, build]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Download all artifacts
         uses: actions/download-artifact@v4
@@ -127,7 +184,19 @@ jobs:
           body: |
             Release ${{ needs.prepare.outputs.version }} of ${{ env.TOOL_NAME }}.
 
-            Assets are named `<tool>-<abi>-<version>.tar.gz`, one per architecture.
+            ## Assets
+
+            Full archives per architecture:
+
+            - `setools-android-<abi>-<version>.tar.gz`
+            - `setools-android-<abi>-<version>.tar.gz.sha256`
+
+            Standalone binaries (no archive), one per utility per architecture:
+
+            - `<utility>-<abi>-<version>`
+            - `<utility>-<abi>-<version>.sha256`
+
+            Supported ABIs: `x86_64`, `aarch64`, `armv7l`, `i686`.
 
             ## Changes
             - Support for injecting multiple rules at once
@@ -135,7 +204,9 @@ jobs:
             - Fixed compilation on newer platforms
           files: |
             artifacts/*.tar.gz
-            artifacts/*.sha256
+            artifacts/*.tar.gz.sha256
+            artifacts/*-*-*.sha256
+            artifacts/*-*-*
           fail_on_unmatched_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
