@@ -1,5 +1,21 @@
 2026-11-16 MootComb <76607017+MootComb@users.noreply.github.com>
 
+	* SETools 4.2
+
+	* sepolicy-inject:
+	  - support for braced permission lists, for example
+	    { search }, {search}, and { read, write }.
+	  - wildcard { * } is now treated the same as *.
+	  - full compatibility with sepolicy.rule files, including
+	    allow, dontaudit, permissive, enforce, and # comments.
+	  - rewritten perms_to_mask() to strip braces, trim
+	    whitespace, and tokenize on commas and spaces in a
+	    single pass.
+	  - add_to_rule_list() now stores permissions through
+	    strip_braces(), so all later checks see a clean string.
+
+2026-11-16 MootComb <76607017+MootComb@users.noreply.github.com>
+
 	* SETools 4.1
 
 	* sepolicy-inject:
