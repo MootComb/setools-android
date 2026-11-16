@@ -7,6 +7,7 @@
 #include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
+#include <errno.h>
 #include <sepol/debug.h>
 #include <sepol/policydb/policydb.h>
 #include <sepol/policydb/expand.h>
@@ -15,13 +16,24 @@
 #include <sepol/policydb/avrule_block.h>
 #include <sepol/policydb/conditional.h>
 
+// Kind of a parsed rule line.
+typedef enum {
+    RULE_ALLOW = 0,   // allow statement -> AVTAB_ALLOWED
+    RULE_DONTAUDIT,   // dontaudit statement -> AVTAB_AUDITDENY
+    RULE_PERMISSIVE,  // permissive <type> -> set bit in permissive_map
+    RULE_ENFORCE      // enforce <type>    -> clear bit in permissive_map
+} rule_kind_t;
+
+// One parsed rule. target/class/perms may be NULL for permissive/enforce.
 typedef struct {
+    rule_kind_t kind;
     char *source;
     char *target;
     char *class;
     char *perms;
 } selinux_rule_t;
 
+// Dynamic array of parsed rules.
 typedef struct {
     selinux_rule_t *rules;
     int count;
@@ -34,14 +46,19 @@ void usage(char *arg0) {
     fprintf(stderr, "Usage:\n");
     fprintf(stderr, "  Single rule: %s -s <source> -t <target> -c <class> -p <perms> [-P policy] [-o output] [-l]\n", arg0);
     fprintf(stderr, "  Multiple rules: %s -f <rules_file> [-P policy] [-o output] [-l]\n", arg0);
+    fprintf(stderr, "  Allow-all: %s -a <domain> [-P policy] [-o output] [-l]\n", arg0);
     fprintf(stderr, "  Permissive: %s -Z <type> [-P policy] [-o output] [-l]\n", arg0);
     fprintf(stderr, "  Non-permissive: %s -z <type> [-P policy] [-o output] [-l]\n", arg0);
     fprintf(stderr, "\nRules file format (one per line):\n");
-    fprintf(stderr, "  source target class perm1,perm2,...\n");
+    fprintf(stderr, "  Bare:        source target class perm1,perm2,...\n");
+    fprintf(stderr, "  sepolicy:    allow|dontaudit source target class perm1,perm2,...\n");
+    fprintf(stderr, "  permissive:  permissive|enforce type\n");
+    fprintf(stderr, "  Wildcards:   * is allowed for target, class and perms\n");
     fprintf(stderr, "  # comments start with #\n");
     exit(1);
 }
 
+// malloc wrapper that exits on OOM.
 void *cmalloc(size_t s) {
     void *t = malloc(s);
     if (t == NULL) {
@@ -51,56 +68,116 @@ void *cmalloc(size_t s) {
     return t;
 }
 
-void add_to_rule_list(char *source, char *target, char *class, char *perms) {
+// Append one parsed rule to the global list. Duplicates strings.
+void add_to_rule_list(rule_kind_t kind, const char *source, const char *target,
+                      const char *class, const char *perms) {
     if (rule_list.count >= rule_list.capacity) {
         rule_list.capacity = rule_list.capacity ? rule_list.capacity * 2 : 16;
-        rule_list.rules = realloc(rule_list.rules, 
+        rule_list.rules = realloc(rule_list.rules,
                                   rule_list.capacity * sizeof(selinux_rule_t));
+        if (!rule_list.rules) {
+            fprintf(stderr, "Out of memory\n");
+            exit(1);
+        }
     }
-    
-    rule_list.rules[rule_list.count].source = strdup(source);
-    rule_list.rules[rule_list.count].target = strdup(target);
-    rule_list.rules[rule_list.count].class = strdup(class);
-    rule_list.rules[rule_list.count].perms = strdup(perms);
-    rule_list.count++;
+    selinux_rule_t *r = &rule_list.rules[rule_list.count++];
+    r->kind   = kind;
+    r->source = strdup(source);
+    r->target = target ? strdup(target) : NULL;
+    r->class  = class  ? strdup(class)  : NULL;
+    r->perms  = perms  ? strdup(perms)  : NULL;
+    if (!r->source || (target && !r->target) ||
+        (class && !r->class) || (perms && !r->perms)) {
+        fprintf(stderr, "Out of memory\n");
+        exit(1);
+    }
 }
 
+// Strip trailing spaces/tabs in place.
+static void strip_trailing(char *s) {
+    char *e = s + strlen(s);
+    while (e > s && (e[-1] == ' ' || e[-1] == '\t')) *--e = 0;
+}
+
+// Parse a rules file. Supports three line formats:
+//   bare:       source target class perms
+//   allow:      allow     source target class perms
+//   dontaudit:  dontaudit source target class perms
+//   permissive: permissive|enforce type
+// Lines starting with '#' and empty lines are skipped.
 int load_rules_file(char *filename) {
     FILE *fp = fopen(filename, "r");
     if (!fp) {
         fprintf(stderr, "Cannot open rules file: %s\n", filename);
         return 1;
     }
-    
-    char line[1024];
+
+    char line[2048];
     int line_num = 0;
-    
+
     while (fgets(line, sizeof(line), fp)) {
         line_num++;
-        
-        if (line[0] == '#' || line[0] == '\n' || line[0] == '\r') 
-            continue;
-        
+
+        // Strip CR/LF.
         line[strcspn(line, "\r\n")] = 0;
-        
-        char source[256], target[256], class[256], perms[256];
-        int parsed = sscanf(line, "%255s %255s %255s %255[^\n]", 
-                           source, target, class, perms);
-        
-        if (parsed == 4) {
-            printf("Rule %d: %s -> %s : %s { %s }\n", 
-                   line_num, source, target, class, perms);
-            add_to_rule_list(source, target, class, perms);
-        } else if (strlen(line) > 0) {
-            fprintf(stderr, "Parse error on line %d: %s\n", line_num, line);
+
+        // Skip leading whitespace.
+        char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+
+        // Skip empty lines and comments.
+        if (*p == 0 || *p == '#')
+            continue;
+
+        // Read the first token; it may be a keyword or a source type.
+        char kw[64] = {0};
+        if (sscanf(p, "%63s", kw) != 1) continue;
+
+        if (strcmp(kw, "allow") == 0 || strcmp(kw, "dontaudit") == 0) {
+            // Keyword-prefixed form: allow|dontaudit S T C P
+            char s[512], t[512], c[512], perms[1024];
+            int n = sscanf(p, "%*s %511s %511s %511s %1023[^\n]",
+                           s, t, c, perms);
+            if (n != 4) {
+                fprintf(stderr, "Parse error line %d: %s\n", line_num, p);
+                continue;
+            }
+            strip_trailing(perms);
+            rule_kind_t k = (strcmp(kw, "allow") == 0) ? RULE_ALLOW : RULE_DONTAUDIT;
+            add_to_rule_list(k, s, t, c, perms);
+            printf("Rule %d: %s %s -> %s : %s { %s }\n", line_num, kw, s, t, c, perms);
+
+        } else if (strcmp(kw, "permissive") == 0 || strcmp(kw, "enforce") == 0) {
+            // permissive|enforce TYPE
+            char s[512];
+            if (sscanf(p, "%*s %511s", s) != 1) {
+                fprintf(stderr, "Parse error line %d: %s\n", line_num, p);
+                continue;
+            }
+            rule_kind_t k = (strcmp(kw, "permissive") == 0) ? RULE_PERMISSIVE : RULE_ENFORCE;
+            add_to_rule_list(k, s, NULL, NULL, NULL);
+            printf("Rule %d: %s %s\n", line_num, kw, s);
+
+        } else {
+            // Fallback: bare form S T C P (backward compatibility).
+            char s[512], t[512], c[512], perms[1024];
+            int n = sscanf(p, "%511s %511s %511s %1023[^\n]", s, t, c, perms);
+            if (n == 4) {
+                strip_trailing(perms);
+                add_to_rule_list(RULE_ALLOW, s, t, c, perms);
+                printf("Rule %d: allow %s -> %s : %s { %s }\n", line_num, s, t, c, perms);
+            } else {
+                fprintf(stderr, "Parse error line %d: %s\n", line_num, p);
+            }
         }
     }
-    
+
     fclose(fp);
     printf("Loaded %d rules\n", rule_list.count);
     return 0;
 }
 
+// Set one bit in the "domain" attribute (used by create_domain).
 void set_attr(char *type, policydb_t *policy, int value) {
     type_datum_t *attr = hashtab_search(policy->p_types.table, type);
     if (!attr) {
@@ -112,11 +189,13 @@ void set_attr(char *type, policydb_t *policy, int value) {
         exit(1);
     }
     if (ebitmap_set_bit(&attr->types, value - 1, 1)) {
-        fprintf(stderr, "error setting attibute: %s\n", type);
+        fprintf(stderr, "error setting attribute: %s\n", type);
         exit(1);
     }
 }
 
+// Create a new TYPE_TYPE domain if it does not exist.
+// Returns its value or 0 on failure (exits on hard errors).
 int create_domain(char *d, policydb_t *policy) {
     symtab_datum_t *src = hashtab_search(policy->p_types.table, d);
     if (src)
@@ -130,7 +209,7 @@ int create_domain(char *d, policydb_t *policy) {
     uint32_t value = 0;
     char *type = strdup(d);
     if (type == NULL) exit(1);
-    
+
     int r = symtab_insert(policy, SYM_TYPES, type, typdatum, SCOPE_DECL, 1, &value);
     if (r) {
         fprintf(stderr, "Failed to insert type into symtab\n");
@@ -138,153 +217,281 @@ int create_domain(char *d, policydb_t *policy) {
     }
     typdatum->s.value = value;
 
-    if (ebitmap_set_bit(&policy->global->branch_list->declared.scope[SYM_TYPES], 
+    // Mark it as declared in the global scope.
+    if (ebitmap_set_bit(&policy->global->branch_list->declared.scope[SYM_TYPES],
                         value - 1, 1)) {
         exit(1);
     }
 
-    policy->type_attr_map = realloc(policy->type_attr_map, 
-                                    sizeof(ebitmap_t)*policy->p_types.nprim);
-    policy->attr_type_map = realloc(policy->attr_type_map, 
-                                    sizeof(ebitmap_t)*policy->p_types.nprim);
-    ebitmap_init(&policy->type_attr_map[value-1]);
-    ebitmap_init(&policy->attr_type_map[value-1]);
-    ebitmap_set_bit(&policy->type_attr_map[value-1], value-1, 1);
+    // Grow type_attr_map / attr_type_map and init the new slot.
+    policy->type_attr_map = realloc(policy->type_attr_map,
+                                    sizeof(ebitmap_t) * policy->p_types.nprim);
+    policy->attr_type_map = realloc(policy->attr_type_map,
+                                    sizeof(ebitmap_t) * policy->p_types.nprim);
+    ebitmap_init(&policy->type_attr_map[value - 1]);
+    ebitmap_init(&policy->attr_type_map[value - 1]);
+    ebitmap_set_bit(&policy->type_attr_map[value - 1], value - 1, 1);
 
+    // Allow every role to use this new type.
     unsigned i;
     for (i = 0; i < policy->p_roles.nprim; ++i) {
         ebitmap_set_bit(&policy->role_val_to_struct[i]->types.negset, value - 1, 0);
         ebitmap_set_bit(&policy->role_val_to_struct[i]->types.types, value - 1, 1);
-        type_set_expand(&policy->role_val_to_struct[i]->types, 
-                       &policy->role_val_to_struct[i]->cache, policy, 0);
+        type_set_expand(&policy->role_val_to_struct[i]->types,
+                        &policy->role_val_to_struct[i]->cache, policy, 0);
     }
 
     src = hashtab_search(policy->p_types.table, d);
     if (!src) {
-        fprintf(stderr, "creating %s failed\n",d);
+        fprintf(stderr, "creating %s failed\n", d);
         exit(1);
     }
 
+    // Rebuild indexes after adding a new type.
     extern int policydb_index_decls(policydb_t * p);
     if (policydb_index_decls(policy)) {
         exit(1);
     }
 
+    // The new type is also a domain.
     set_attr("domain", policy, value);
     return value;
 }
 
-int add_rule(char *s, char *t, char *c, char *p, policydb_t *policy) {
-    type_datum_t *src, *tgt;
-    class_datum_t *cls;
-    perm_datum_t *perm;
-    avtab_datum_t *av;
-    avtab_key_t key;
-
-    src = hashtab_search(policy->p_types.table, s);
-    if (src == NULL) {
-        fprintf(stderr, "source type %s does not exist\n", s);
-        return 2;
-    }
-    tgt = hashtab_search(policy->p_types.table, t);
-    if (tgt == NULL) {
-        fprintf(stderr, "target type %s does not exist\n", t);
-        return 2;
-    }
-    cls = hashtab_search(policy->p_classes.table, c);
-    if (cls == NULL) {
-        fprintf(stderr, "class %s does not exist\n", c);
-        return 2;
-    }
-
+// Convert a comma/space-separated permission list into a bitmask.
+// Looks up permissions in the class and, if needed, its common.
+// Returns 0 on success, non-zero on error.
+static int perms_to_mask(class_datum_t *cls, const char *p, uint32_t *out) {
     uint32_t data = 0;
-    char *p_copy = strdup(p);
-    char *p_saveptr = NULL;
-    char *p_token;
-    if (p_copy == NULL) {
-        fprintf(stderr, "memory allocation error\n");
-        return 1;
-    }
-    p_token = strtok_r(p_copy, ",", &p_saveptr);
-    while (p_token) {
-        perm = hashtab_search(cls->permissions.table, p_token);
-        if (perm == NULL) {
-            if (cls->comdatum == NULL) {
-                fprintf(stderr, "perm %s does not exist in class %s\n", p_token, c);
-                free(p_copy);
-                return 2;
-            }
-            perm = hashtab_search(cls->comdatum->permissions.table, p_token);
-            if (perm == NULL) {
-                fprintf(stderr, "perm %s does not exist in class %s\n", p_token, c);
-                free(p_copy);
-                return 2;
-            }
+    char *copy = strdup(p);
+    if (!copy) return 1;
+    char *save = NULL, *tok = strtok_r(copy, ", \t", &save);
+    while (tok) {
+        perm_datum_t *perm = hashtab_search(cls->permissions.table, tok);
+        if (!perm && cls->comdatum)
+            perm = hashtab_search(cls->comdatum->permissions.table, tok);
+        if (!perm) {
+            fprintf(stderr, "perm %s does not exist in class %s\n",
+                    tok, cls->s.name ? cls->s.name : "?");
+            free(copy);
+            return 2;
         }
         data |= 1U << (perm->s.value - 1);
-        p_token = strtok_r(NULL, ",", &p_saveptr);
+        tok = strtok_r(NULL, ", \t", &save);
     }
-    free(p_copy);
+    free(copy);
+    *out = data;
+    return 0;
+}
 
-    key.source_type = src->s.value;
-    key.target_type = tgt->s.value;
-    key.target_class = cls->s.value;
-    key.specified = AVTAB_ALLOWED;
-    av = avtab_search(&policy->te_avtab, &key);
+// Mask with all permissions of a class (own + common).
+// Limited to 32 bits by avtab_datum_t.data.
+static uint32_t all_perms_mask(class_datum_t *cls) {
+    unsigned total = cls->permissions.nprim;
+    if (cls->comdatum) total += cls->comdatum->permissions.nprim;
+    if (total == 0) return 0;
+    if (total > 32) {
+        fprintf(stderr, "warning: class %s has %u perms (mask truncated to 32)\n",
+                cls->s.name ? cls->s.name : "?", total);
+        total = 32;
+    }
+    if (total == 32) return 0xFFFFFFFFu;
+    return (1u << total) - 1u;
+}
 
-    if (av == NULL) {
+// Insert or merge one avtab entry.
+// For dontaudit we store the inverse mask, matching sepol semantics.
+static int apply_one_av(policydb_t *policy,
+                        uint32_t s_val, uint32_t t_val, uint32_t c_val,
+                        uint32_t data, int is_dontaudit) {
+    avtab_key_t key;
+    key.source_type = s_val;
+    key.target_type = t_val;
+    key.target_class = c_val;
+    key.specified   = is_dontaudit ? AVTAB_AUDITDENY : AVTAB_ALLOWED;
+
+    avtab_datum_t *av = avtab_search(&policy->te_avtab, &key);
+    if (!av) {
         av = cmalloc(sizeof(*av));
-        av->data = data;
-        int ret = avtab_insert(&policy->te_avtab, &key, av);
-        if (ret) {
+        av->data = is_dontaudit ? ~data : data;
+        if (avtab_insert(&policy->te_avtab, &key, av)) {
             fprintf(stderr, "Error inserting into avtab\n");
             return 1;
         }
     } else {
-        av->data |= data;
+        if (is_dontaudit) av->data &= ~data;
+        else              av->data |=  data;
     }
-
     return 0;
 }
 
-int apply_all_rules(policydb_t *policy) {
-    int errors = 0;
-    
-    for (int i = 0; i < rule_list.count; i++) {
-        printf("Applying rule %d/%d: %s -> %s : %s { %s }\n", 
-               i+1, rule_list.count,
-               rule_list.rules[i].source,
-               rule_list.rules[i].target,
-               rule_list.rules[i].class,
-               rule_list.rules[i].perms);
-        
-        type_datum_t *type;
-        type = hashtab_search(policy->p_types.table, rule_list.rules[i].source);
-        if (!type) {
-            printf("Creating source type: %s\n", rule_list.rules[i].source);
-            create_domain(rule_list.rules[i].source, policy);
+// Context passed to walk_types_cb.
+typedef struct {
+    policydb_t *policy;
+    uint32_t s_val;
+    int is_dontaudit;
+    const char *c_pat;
+    const char *p_pat;
+    int errors;
+} walk_ctx_t;
+
+// Callback used when target is "*": iterate all concrete types.
+// For each type, iterate all matching classes and insert the rule.
+static int walk_types_cb(hashtab_key_t key, hashtab_datum_t datum, void *ptr) {
+    (void)key;
+    walk_ctx_t *ctx = ptr;
+    type_datum_t *td = (type_datum_t *) datum;
+    if (td->flavor != TYPE_TYPE) return 0;   // skip attributes
+    if (td->s.value == 0) return 0;
+
+    policydb_t *pol = ctx->policy;
+    uint32_t t_val = td->s.value;
+
+    for (unsigned i = 0; i < pol->p_classes.nprim; i++) {
+        class_datum_t *cls = pol->class_val_to_struct[i];
+        if (!cls) continue;
+        const char *cname = cls->s.name;
+
+        // Filter by class pattern.
+        if (ctx->c_pat && strcmp(ctx->c_pat, "*") != 0 &&
+            (!cname || strcmp(ctx->c_pat, cname) != 0))
+            continue;
+
+        // Resolve permission mask (or all perms for "*").
+        uint32_t mask;
+        if (ctx->p_pat && strcmp(ctx->p_pat, "*") == 0) {
+            mask = all_perms_mask(cls);
+        } else if (perms_to_mask(cls, ctx->p_pat, &mask)) {
+            ctx->errors++;
+            continue;
         }
-        
-        type = hashtab_search(policy->p_types.table, rule_list.rules[i].target);
-        if (!type) {
-            printf("Creating target type: %s\n", rule_list.rules[i].target);
-            create_domain(rule_list.rules[i].target, policy);
+
+        if (apply_one_av(pol, ctx->s_val, t_val, cls->s.value,
+                         mask, ctx->is_dontaudit))
+            ctx->errors++;
+    }
+    return 0;
+}
+
+// Add an allow or dontaudit rule.
+// '*' is supported for target, class and perms.
+int add_rule_ex(const char *s, const char *t, const char *c, const char *p,
+                policydb_t *policy, int is_dontaudit) {
+    type_datum_t *src = hashtab_search(policy->p_types.table, (char *)s);
+    if (!src) {
+        fprintf(stderr, "source type %s does not exist\n", s);
+        return 2;
+    }
+
+    int target_wild = (strcmp(t, "*") == 0);
+
+    if (!target_wild) {
+        type_datum_t *tgt = hashtab_search(policy->p_types.table, (char *)t);
+        if (!tgt) {
+            fprintf(stderr, "target type %s does not exist\n", t);
+            return 2;
         }
-        
-        int ret = add_rule(rule_list.rules[i].source,
-                          rule_list.rules[i].target,
-                          rule_list.rules[i].class,
-                          rule_list.rules[i].perms,
-                          policy);
-        if (ret) {
-            fprintf(stderr, "Failed to apply rule %d\n", i+1);
-            errors++;
+
+        if (strcmp(c, "*") == 0) {
+            // Concrete target, wildcard class: iterate all classes.
+            int errs = 0;
+            for (unsigned i = 0; i < policy->p_classes.nprim; i++) {
+                class_datum_t *cls = policy->class_val_to_struct[i];
+                if (!cls) continue;
+                uint32_t mask;
+                if (strcmp(p, "*") == 0) mask = all_perms_mask(cls);
+                else if (perms_to_mask(cls, p, &mask)) { errs++; continue; }
+                if (apply_one_av(policy, src->s.value, tgt->s.value,
+                                 cls->s.value, mask, is_dontaudit))
+                    errs++;
+            }
+            return errs ? 1 : 0;
+        } else {
+            // Concrete target and class.
+            class_datum_t *cls = hashtab_search(policy->p_classes.table, (char *)c);
+            if (!cls) {
+                fprintf(stderr, "class %s does not exist\n", c);
+                return 2;
+            }
+            uint32_t mask;
+            if (strcmp(p, "*") == 0) mask = all_perms_mask(cls);
+            else if (perms_to_mask(cls, p, &mask)) return 2;
+            return apply_one_av(policy, src->s.value, tgt->s.value,
+                                cls->s.value, mask, is_dontaudit);
         }
     }
-    
+
+    // Wildcard target: iterate all concrete types.
+    walk_ctx_t ctx = { .policy = policy, .s_val = src->s.value,
+                       .is_dontaudit = is_dontaudit,
+                       .c_pat = c, .p_pat = p, .errors = 0 };
+    hashtab_map(policy->p_types.table, walk_types_cb, &ctx);
+    return ctx.errors ? 1 : 0;
+}
+
+// Backward-compatible wrapper for allow-only.
+int add_rule(char *s, char *t, char *c, char *p, policydb_t *policy) {
+    return add_rule_ex(s, t, c, p, policy, 0);
+}
+
+// Apply all parsed rules in order.
+// Creates missing source/target types on demand.
+int apply_all_rules(policydb_t *policy) {
+    int errors = 0;
+
+    for (int i = 0; i < rule_list.count; i++) {
+        selinux_rule_t *r = &rule_list.rules[i];
+
+        if (r->kind == RULE_PERMISSIVE || r->kind == RULE_ENFORCE) {
+            // Toggle permissive bit for the type.
+            type_datum_t *type = hashtab_search(policy->p_types.table, r->source);
+            if (!type) {
+                fprintf(stderr, "type %s does not exist\n", r->source);
+                errors++;
+                continue;
+            }
+            int val = (r->kind == RULE_PERMISSIVE) ? 1 : 0;
+            if (ebitmap_set_bit(&policy->permissive_map, type->s.value, val)) {
+                fprintf(stderr, "Could not set bit in permissive map for %s\n", r->source);
+                errors++;
+            } else {
+                printf("%s %s\n",
+                       r->kind == RULE_PERMISSIVE ? "permissive" : "enforce",
+                       r->source);
+            }
+            continue;
+        }
+
+        // allow / dontaudit: create missing types first.
+        type_datum_t *type = hashtab_search(policy->p_types.table, r->source);
+        if (!type) {
+            printf("Creating source type: %s\n", r->source);
+            create_domain(r->source, policy);
+        }
+        if (r->target && strcmp(r->target, "*") != 0) {
+            type = hashtab_search(policy->p_types.table, r->target);
+            if (!type) {
+                printf("Creating target type: %s\n", r->target);
+                create_domain(r->target, policy);
+            }
+        }
+
+        int ret = add_rule_ex(r->source, r->target, r->class, r->perms,
+                              policy, r->kind == RULE_DONTAUDIT);
+        if (ret) {
+            fprintf(stderr, "Failed rule %d\n", i + 1);
+            errors++;
+        } else {
+            printf("Applied %s %s -> %s : %s { %s }\n",
+                   r->kind == RULE_DONTAUDIT ? "dontaudit" : "allow",
+                   r->source, r->target, r->class, r->perms);
+        }
+    }
+
     return errors;
 }
 
+// Load a binary policy from file into memory-mapped policydb.
 int load_policy(char *filename, policydb_t *policydb, struct policy_file *pf) {
     int fd;
     struct stat sb;
@@ -331,31 +538,43 @@ int load_policy(char *filename, policydb_t *policydb, struct policy_file *pf) {
     return 0;
 }
 
+// Serialize policydb to image and write it to the kernel.
 int load_policy_into_kernel(policydb_t *policydb) {
     char *filename = "/sys/fs/selinux/load";
     int fd, ret;
     void *data = NULL;
     size_t len;
 
-    policydb_to_image(NULL, policydb, &data, &len);
+    if (policydb_to_image(NULL, policydb, &data, &len)) {
+        fprintf(stderr, "Could not convert policy to image\n");
+        return 1;
+    }
 
     fd = open(filename, O_RDWR);
     if (fd < 0) {
         fprintf(stderr, "Can't open '%s':  %s\n", filename, strerror(errno));
+        free(data);
         return 1;
     }
-    
+
     ret = write(fd, data, len);
     close(fd);
-    
+    free(data);
+
     if (ret < 0) {
         fprintf(stderr, "Could not write policy to %s\n", filename);
         return 1;
     }
-    
+
     printf("Policy loaded successfully (%zu bytes)\n", len);
     return 0;
 }
+
+// Selection modes for the main() switch.
+#define SEL_ADD_RULE    1
+#define SEL_PERMISSIVE  2
+#define SEL_MULTI_RULE  3
+#define SEL_ALLOW_ALL   4
 
 int main(int argc, char **argv) {
     char *policy = NULL, *source = NULL, *target = NULL, *class = NULL, *outfile = NULL;
@@ -369,10 +588,6 @@ int main(int argc, char **argv) {
     int permissive_value = 0;
     int typeval;
     type_datum_t *type;
-    
-#define SEL_ADD_RULE 1
-#define SEL_PERMISSIVE 2
-#define SEL_MULTI_RULE 3
     int selected = 0;
 
     struct option long_options[] = {
@@ -386,31 +601,23 @@ int main(int argc, char **argv) {
         {"not-permissive", required_argument, NULL, 'z'},
         {"load", no_argument, NULL, 'l'},
         {"file", required_argument, NULL, 'f'},
+        {"allow-all", required_argument, NULL, 'a'},
         {NULL, 0, NULL, 0}
     };
 
-    while ((ch = getopt_long(argc, argv, "s:t:c:p:P:o:Z:z:lf:", long_options, NULL)) != -1) {
+    while ((ch = getopt_long(argc, argv, "s:t:c:p:P:o:Z:z:lf:a:",
+                             long_options, NULL)) != -1) {
         switch (ch) {
         case 's':
             if (selected && selected != SEL_ADD_RULE) usage(argv[0]);
             selected = SEL_ADD_RULE;
             source = optarg;
             break;
-        case 't':
-            target = optarg;
-            break;
-        case 'c':
-            class = optarg;
-            break;
-        case 'p':
-            perms = optarg;
-            break;
-        case 'P':
-            policy = optarg;
-            break;
-        case 'o':
-            outfile = optarg;
-            break;
+        case 't': target = optarg; break;
+        case 'c': class  = optarg; break;
+        case 'p': perms  = optarg; break;
+        case 'P': policy = optarg; break;
+        case 'o': outfile = optarg; break;
         case 'Z':
             if (selected) usage(argv[0]);
             selected = SEL_PERMISSIVE;
@@ -423,30 +630,34 @@ int main(int argc, char **argv) {
             source = optarg;
             permissive_value = 0;
             break;
-        case 'l':
-            load = 1;
-            break;
+        case 'l': load = 1; break;
         case 'f':
             if (selected) usage(argv[0]);
             selected = SEL_MULTI_RULE;
             rules_file = optarg;
+            break;
+        case 'a':
+            if (selected) usage(argv[0]);
+            selected = SEL_ALLOW_ALL;
+            source = optarg;
             break;
         default:
             usage(argv[0]);
         }
     }
 
+    // Validate required arguments for the chosen mode.
     if (!selected) usage(argv[0]);
-    
     if (selected == SEL_ADD_RULE && (!source || !target || !class || !perms))
         usage(argv[0]);
-        
     if (selected == SEL_MULTI_RULE && !rules_file)
         usage(argv[0]);
+    if (selected == SEL_ALLOW_ALL && !source)
+        usage(argv[0]);
 
+    // Default outfile: same as input policy (in-place edit).
     if (!outfile && policy)
         outfile = policy;
-
     if (!policy)
         policy = "/sys/fs/selinux/policy";
 
@@ -466,36 +677,52 @@ int main(int argc, char **argv) {
             fprintf(stderr, "Failed to load rules file\n");
             return 1;
         }
-        
         if (apply_all_rules(&policydb)) {
             fprintf(stderr, "Some rules failed to apply\n");
             return 1;
         }
     } else if (selected == SEL_ADD_RULE) {
+        // Single rule via -s -t -c -p.
         type = hashtab_search(policydb.p_types.table, source);
         if (type == NULL) {
             fprintf(stderr, "type %s does not exist, creating\n", source);
             create_domain(source, &policydb);
         }
-        
         if (add_rule(source, target, class, perms, &policydb)) {
             fprintf(stderr, "Could not add rule\n");
             return 1;
         }
     } else if (selected == SEL_PERMISSIVE) {
+        // Toggle permissive bit for a single type.
         type = hashtab_search(policydb.p_types.table, source);
         if (!type) {
             fprintf(stderr, "type %s does not exist\n", source);
             return 1;
         }
         typeval = type->s.value;
-        
         if (ebitmap_set_bit(&policydb.permissive_map, typeval, permissive_value)) {
             fprintf(stderr, "Could not set bit in permissive map\n");
             return 1;
         }
+    } else if (selected == SEL_ALLOW_ALL) {
+        // Allow everything for the domain, and suppress AVC noise.
+        type = hashtab_search(policydb.p_types.table, source);
+        if (!type) {
+            fprintf(stderr, "type %s does not exist\n", source);
+            return 1;
+        }
+        printf("Allow-all for domain %s (allow + dontaudit)\n", source);
+        if (add_rule_ex(source, "*", "*", "*", &policydb, 0)) {
+            fprintf(stderr, "allow-all failed\n");
+            return 1;
+        }
+        if (add_rule_ex(source, "*", "*", "*", &policydb, 1)) {
+            fprintf(stderr, "dontaudit-all failed\n");
+            return 1;
+        }
     }
 
+    // Either load into kernel or write to file.
     if (load) {
         if (load_policy_into_kernel(&policydb)) {
             fprintf(stderr, "Could not load new policy into kernel\n");
@@ -508,19 +735,19 @@ int main(int argc, char **argv) {
             fprintf(stderr, "Could not open outfile\n");
             return 1;
         }
-
         policy_file_init(&outpf);
         outpf.type = PF_USE_STDIO;
         outpf.fp = fp;
-
         if (policydb_write(&policydb, &outpf)) {
             fprintf(stderr, "Could not write policy\n");
+            fclose(fp);
             return 1;
         }
         fclose(fp);
         printf("Policy with all rules saved to %s\n", outfile);
     }
 
+    // Cleanup.
     if (rule_list.rules) {
         for (int i = 0; i < rule_list.count; i++) {
             free(rule_list.rules[i].source);
