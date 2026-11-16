@@ -1,9 +1,32 @@
+2026-11-16 MootComb <76607017+MootComb@users.noreply.github.com>
+
+	* SETools 4.1
+
+	* sepolicy-inject:
+	  - full sepolicy.rule-compatible parser (allow / dontaudit /
+	    permissive / enforce, # comments).
+	  - support for wildcard "*" in the target type, class, and
+	    permission fields.
+	  - new -a/--allow-all <domain> option to grant a domain every
+	    permission on every type and class and to suppress AVC
+	    messages for that domain via dontaudit rules.
+	  - the bare "source target class perms" format kept as a
+	    fallback for backward compatibility.
+	  - class permission masks now cover permissions inherited from
+	    the class's common definition, capped at 32 bits with a
+	    warning.
+	  - fixed an error where the return value of policydb_to_image()
+	    was ignored.
+	  - fixed memory leaks on error paths in load_rules_file().
+
 2026-11-15 MootComb <76607017+MootComb@users.noreply.github.com>
 
 	* SETools 4.0
-	* Support for injecting multiple rules at once.
-	* Support for rules files (one rule per line).
-	* Fixed compilation on newer platforms.
+
+	* sepolicy-inject:
+	  - support for injecting multiple rules at once.
+	  - support for rules files, one rule per line.
+	  - fixed compilation on newer platforms.
 
 2013-01-08 Steve Lawrence <slawrence@tresys.com>
 
