@@ -99,11 +99,12 @@ void usage(char *arg0) {
     fprintf(stderr, "  sepolicy:    allow|dontaudit source target class perm1,perm2,...\n");
     fprintf(stderr, "  permissive:  permissive|enforce type\n");
     fprintf(stderr, "  Wildcards:   * is allowed for target, class and perms\n");
+    fprintf(stderr, "  Permissions may be wrapped in braces: { read write } or {read,write}\n");
     fprintf(stderr, "  # comments start with #\n");
     exit(1);
 }
 
-// malloc wrapper that exits on OOM.
+// malloc wrapper that exits on out of memory.
 void *cmalloc(size_t s) {
     void *t = malloc(s);
     if (t == NULL) {
@@ -113,7 +114,44 @@ void *cmalloc(size_t s) {
     return t;
 }
 
+// Strip trailing spaces and tabs in place.
+static void strip_trailing(char *s) {
+    char *e = s + strlen(s);
+    while (e > s && (e[-1] == ' ' || e[-1] == '\t')) *--e = 0;
+}
+
+// Return a malloc'd copy of the permission string with braces removed
+// and surrounding whitespace trimmed. Caller must free the result.
+// Examples: "{search}" -> "search", "{ * }" -> "*", "{ read, write }" -> "read, write"
+static char *strip_braces(const char *p) {
+    if (!p) return NULL;
+    char *copy = strdup(p);
+    if (!copy) return NULL;
+
+    // Remove all braces in place.
+    char *write_ptr = copy;
+    for (char *read_ptr = copy; *read_ptr; read_ptr++) {
+        if (*read_ptr == '{' || *read_ptr == '}') continue;
+        *write_ptr++ = *read_ptr;
+    }
+    *write_ptr = 0;
+
+    // Trim leading whitespace.
+    char *start = copy;
+    while (*start == ' ' || *start == '\t') start++;
+
+    // Trim trailing whitespace.
+    char *end = start + strlen(start);
+    while (end > start && (end[-1] == ' ' || end[-1] == '\t')) *--end = 0;
+
+    // Move trimmed content to the beginning of the buffer.
+    if (start != copy) memmove(copy, start, end - start + 1);
+
+    return copy;
+}
+
 // Append one parsed rule to the global list. Duplicates strings.
+// Braces are stripped from the permission string before storing.
 void add_to_rule_list(rule_kind_t kind, const char *source, const char *target,
                       const char *class, const char *perms) {
     if (rule_list.count >= rule_list.capacity) {
@@ -125,31 +163,28 @@ void add_to_rule_list(rule_kind_t kind, const char *source, const char *target,
             exit(1);
         }
     }
-    selinux_rule_t *r = &rule_list.rules[rule_list.count++];
-    r->kind   = kind;
-    r->source = strdup(source);
-    r->target = target ? strdup(target) : NULL;
-    r->class  = class  ? strdup(class)  : NULL;
-    r->perms  = perms  ? strdup(perms)  : NULL;
-    if (!r->source || (target && !r->target) ||
-        (class && !r->class) || (perms && !r->perms)) {
+    selinux_rule_t *rule = &rule_list.rules[rule_list.count++];
+    rule->kind   = kind;
+    rule->source = strdup(source);
+    rule->target = target ? strdup(target) : NULL;
+    rule->class  = class  ? strdup(class)  : NULL;
+    rule->perms  = strip_braces(perms);
+    if (!rule->source || (target && !rule->target) ||
+        (class && !rule->class) || (perms && !rule->perms)) {
         fprintf(stderr, "Out of memory\n");
         exit(1);
     }
 }
 
-// Strip trailing spaces/tabs in place.
-static void strip_trailing(char *s) {
-    char *e = s + strlen(s);
-    while (e > s && (e[-1] == ' ' || e[-1] == '\t')) *--e = 0;
-}
-
-// Parse a rules file. Supports three line formats:
+// Parse a rules file. Supports these line formats:
 //   bare:       source target class perms
 //   allow:      allow     source target class perms
 //   dontaudit:  dontaudit source target class perms
-//   permissive: permissive|enforce type
-// Lines starting with '#' and empty lines are skipped.
+//   permissive: permissive type
+//   enforce:    enforce type
+// Permissions may be separated by commas or spaces, and may be wrapped
+// in braces, for example: { read, write } or {search} or read,write.
+// Lines starting with '#' (including '##') and empty lines are skipped.
 int load_rules_file(char *filename) {
     FILE *fp = fopen(filename, "r");
     if (!fp) {
@@ -303,26 +338,53 @@ int create_domain(char *d, policydb_t *policy) {
     return value;
 }
 
-// Convert a comma/space-separated permission list into a bitmask.
-// Looks up permissions in the class and, if needed, its common.
+// Convert a permission list into a bitmask.
+// Accepts: "read,write", "read write", "{ read write }", "{read,write}", "*"
 // Returns 0 on success, non-zero on error.
 static int perms_to_mask(class_datum_t *cls, const char *p, uint32_t *out) {
     uint32_t data = 0;
     char *copy = strdup(p);
     if (!copy) return 1;
-    char *save = NULL, *tok = strtok_r(copy, ", \t", &save);
-    while (tok) {
-        perm_datum_t *perm = hashtab_search(cls->permissions.table, tok);
+
+    // Strip braces anywhere in the string, in place.
+    char *write_ptr = copy;
+    for (char *read_ptr = copy; *read_ptr; read_ptr++) {
+        if (*read_ptr == '{' || *read_ptr == '}') continue;
+        *write_ptr++ = *read_ptr;
+    }
+    *write_ptr = 0;
+
+    // Trim leading whitespace.
+    char *start = copy;
+    while (*start == ' ' || *start == '\t' || *start == '\n' || *start == '\r') start++;
+
+    // Trim trailing whitespace.
+    char *end = start + strlen(start);
+    while (end > start && (end[-1] == ' ' || end[-1] == '\t' ||
+                           end[-1] == '\n' || end[-1] == '\r')) {
+        *--end = 0;
+    }
+
+    if (*start == 0) {
+        free(copy);
+        *out = 0;
+        return 0;
+    }
+
+    char *save = NULL;
+    char *token = strtok_r(start, ", \t", &save);
+    while (token) {
+        perm_datum_t *perm = hashtab_search(cls->permissions.table, token);
         if (!perm && cls->comdatum)
-            perm = hashtab_search(cls->comdatum->permissions.table, tok);
+            perm = hashtab_search(cls->comdatum->permissions.table, token);
         if (!perm) {
             fprintf(stderr, "perm %s does not exist in class %s\n",
-                    tok, class_name(cls));
+                    token, class_name(cls));
             free(copy);
             return 2;
         }
         data |= 1U << (perm->s.value - 1);
-        tok = strtok_r(NULL, ", \t", &save);
+        token = strtok_r(NULL, ", \t", &save);
     }
     free(copy);
     *out = data;
