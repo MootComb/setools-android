@@ -42,6 +42,51 @@ typedef struct {
 
 rule_list_t rule_list = {NULL, 0, 0};
 
+// Reverse map: class value -> class name.
+// In this libsepol version the class name lives in the hashtab key of
+// policydb->p_classes.table, not in symtab_datum. We build the map once and
+// keep borrowed pointers to the keys (owned by the policydb).
+static const char **class_names = NULL;
+static uint32_t class_names_nprim = 0;
+
+typedef struct {
+    policydb_t *policy;
+    const char **names;
+} class_names_ctx_t;
+
+static int class_names_cb(hashtab_key_t key, hashtab_datum_t datum, void *ptr) {
+    class_names_ctx_t *ctx = ptr;
+    class_datum_t *cls = (class_datum_t *)datum;
+    if (!cls || cls->s.value == 0 || cls->s.value > ctx->policy->p_classes.nprim)
+        return 0;
+    ctx->names[cls->s.value - 1] = (const char *)key;
+    return 0;
+}
+
+// Build (once) the class value -> name map. Returns 0 on success.
+static int build_class_names(policydb_t *policy) {
+    if (class_names && class_names_nprim == policy->p_classes.nprim)
+        return 0;
+
+    free(class_names);
+    class_names = calloc(policy->p_classes.nprim, sizeof(*class_names));
+    if (!class_names) return 1;
+    class_names_nprim = policy->p_classes.nprim;
+
+    class_names_ctx_t ctx = { .policy = policy, .names = class_names };
+    hashtab_map(policy->p_classes.table, class_names_cb, &ctx);
+    return 0;
+}
+
+// Return the class name, or "?" if the map is not built or the value is bad.
+static const char *class_name(class_datum_t *cls) {
+    if (!cls || cls->s.value == 0 ||
+        cls->s.value > class_names_nprim || !class_names)
+        return "?";
+    const char *n = class_names[cls->s.value - 1];
+    return n ? n : "?";
+}
+
 void usage(char *arg0) {
     fprintf(stderr, "Usage:\n");
     fprintf(stderr, "  Single rule: %s -s <source> -t <target> -c <class> -p <perms> [-P policy] [-o output] [-l]\n", arg0);
@@ -272,7 +317,7 @@ static int perms_to_mask(class_datum_t *cls, const char *p, uint32_t *out) {
             perm = hashtab_search(cls->comdatum->permissions.table, tok);
         if (!perm) {
             fprintf(stderr, "perm %s does not exist in class %s\n",
-                    tok, cls->s.name ? cls->s.name : "?");
+                    tok, class_name(cls));
             free(copy);
             return 2;
         }
@@ -292,7 +337,7 @@ static uint32_t all_perms_mask(class_datum_t *cls) {
     if (total == 0) return 0;
     if (total > 32) {
         fprintf(stderr, "warning: class %s has %u perms (mask truncated to 32)\n",
-                cls->s.name ? cls->s.name : "?", total);
+                class_name(cls), total);
         total = 32;
     }
     if (total == 32) return 0xFFFFFFFFu;
@@ -330,8 +375,8 @@ typedef struct {
     policydb_t *policy;
     uint32_t s_val;
     int is_dontaudit;
-    const char *c_pat;
-    const char *p_pat;
+    uint32_t c_val;      // 0 = any class
+    const char *p_pat;   // NULL or "*" = all perms
     int errors;
 } walk_ctx_t;
 
@@ -350,11 +395,9 @@ static int walk_types_cb(hashtab_key_t key, hashtab_datum_t datum, void *ptr) {
     for (unsigned i = 0; i < pol->p_classes.nprim; i++) {
         class_datum_t *cls = pol->class_val_to_struct[i];
         if (!cls) continue;
-        const char *cname = cls->s.name;
 
-        // Filter by class pattern.
-        if (ctx->c_pat && strcmp(ctx->c_pat, "*") != 0 &&
-            (!cname || strcmp(ctx->c_pat, cname) != 0))
+        // Filter by class value (0 = any).
+        if (ctx->c_val != 0 && cls->s.value != ctx->c_val)
             continue;
 
         // Resolve permission mask (or all perms for "*").
@@ -377,6 +420,11 @@ static int walk_types_cb(hashtab_key_t key, hashtab_datum_t datum, void *ptr) {
 // '*' is supported for target, class and perms.
 int add_rule_ex(const char *s, const char *t, const char *c, const char *p,
                 policydb_t *policy, int is_dontaudit) {
+    if (build_class_names(policy)) {
+        fprintf(stderr, "Out of memory building class name map\n");
+        return 1;
+    }
+
     type_datum_t *src = hashtab_search(policy->p_types.table, (char *)s);
     if (!src) {
         fprintf(stderr, "source type %s does not exist\n", s);
@@ -384,47 +432,64 @@ int add_rule_ex(const char *s, const char *t, const char *c, const char *p,
     }
 
     int target_wild = (strcmp(t, "*") == 0);
+    int class_wild  = (strcmp(c, "*") == 0);
+    int perms_wild  = (strcmp(p, "*") == 0);
 
+    // Resolve concrete target type once (if not wildcard).
+    type_datum_t *tgt = NULL;
     if (!target_wild) {
-        type_datum_t *tgt = hashtab_search(policy->p_types.table, (char *)t);
+        tgt = hashtab_search(policy->p_types.table, (char *)t);
         if (!tgt) {
             fprintf(stderr, "target type %s does not exist\n", t);
             return 2;
         }
+    }
 
-        if (strcmp(c, "*") == 0) {
-            // Concrete target, wildcard class: iterate all classes.
-            int errs = 0;
-            for (unsigned i = 0; i < policy->p_classes.nprim; i++) {
-                class_datum_t *cls = policy->class_val_to_struct[i];
-                if (!cls) continue;
-                uint32_t mask;
-                if (strcmp(p, "*") == 0) mask = all_perms_mask(cls);
-                else if (perms_to_mask(cls, p, &mask)) { errs++; continue; }
-                if (apply_one_av(policy, src->s.value, tgt->s.value,
-                                 cls->s.value, mask, is_dontaudit))
-                    errs++;
-            }
-            return errs ? 1 : 0;
-        } else {
-            // Concrete target and class.
-            class_datum_t *cls = hashtab_search(policy->p_classes.table, (char *)c);
-            if (!cls) {
-                fprintf(stderr, "class %s does not exist\n", c);
-                return 2;
-            }
-            uint32_t mask;
-            if (strcmp(p, "*") == 0) mask = all_perms_mask(cls);
-            else if (perms_to_mask(cls, p, &mask)) return 2;
-            return apply_one_av(policy, src->s.value, tgt->s.value,
-                                cls->s.value, mask, is_dontaudit);
+    // Resolve concrete class once (if not wildcard).
+    class_datum_t *cls = NULL;
+    if (!class_wild) {
+        cls = hashtab_search(policy->p_classes.table, (char *)c);
+        if (!cls) {
+            fprintf(stderr, "class %s does not exist\n", c);
+            return 2;
         }
     }
 
-    // Wildcard target: iterate all concrete types.
+    // Case 1: concrete target, concrete class, concrete perms.
+    if (!target_wild && !class_wild && !perms_wild) {
+        uint32_t mask;
+        if (perms_to_mask(cls, p, &mask)) return 2;
+        return apply_one_av(policy, src->s.value, tgt->s.value,
+                            cls->s.value, mask, is_dontaudit);
+    }
+
+    // Case 2: concrete target, concrete class, wildcard perms.
+    if (!target_wild && !class_wild && perms_wild) {
+        return apply_one_av(policy, src->s.value, tgt->s.value,
+                            cls->s.value, all_perms_mask(cls), is_dontaudit);
+    }
+
+    // Case 3: concrete target, wildcard class: iterate all classes.
+    if (!target_wild && class_wild) {
+        int errs = 0;
+        for (unsigned i = 0; i < policy->p_classes.nprim; i++) {
+            class_datum_t *ci = policy->class_val_to_struct[i];
+            if (!ci) continue;
+            uint32_t mask;
+            if (perms_wild) mask = all_perms_mask(ci);
+            else if (perms_to_mask(ci, p, &mask)) { errs++; continue; }
+            if (apply_one_av(policy, src->s.value, tgt->s.value,
+                             ci->s.value, mask, is_dontaudit))
+                errs++;
+        }
+        return errs ? 1 : 0;
+    }
+
+    // Case 4: wildcard target: iterate all concrete types.
     walk_ctx_t ctx = { .policy = policy, .s_val = src->s.value,
                        .is_dontaudit = is_dontaudit,
-                       .c_pat = c, .p_pat = p, .errors = 0 };
+                       .c_val = cls ? cls->s.value : 0,
+                       .p_pat = p, .errors = 0 };
     hashtab_map(policy->p_types.table, walk_types_cb, &ctx);
     return ctx.errors ? 1 : 0;
 }
@@ -757,6 +822,10 @@ int main(int argc, char **argv) {
         }
         free(rule_list.rules);
     }
+
+    free(class_names);
+    class_names = NULL;
+    class_names_nprim = 0;
 
     policydb_destroy(&policydb);
     return 0;
